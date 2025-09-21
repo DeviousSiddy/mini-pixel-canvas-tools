@@ -18,11 +18,13 @@ class ImageToCommandsApp:
         self.root.resizable(False, False)
 
         # --- Load Data ---
-        self.palette_rgb = self._load_palette()
-        if not self.palette_rgb:
+        self.palette_data = self._load_palette()
+        if not self.palette_data:
             messagebox.showerror("Error", f"Could not load or parse '{PALETTE_FILE}'.")
             self.root.destroy()
             return
+        # Pre-calculate LAB values for the palette for efficiency
+        self._precalculate_lab_palette()
 
         # --- UI Setup ---
         self.main_frame = ttk.Frame(self.root, padding="10")
@@ -64,25 +66,63 @@ class ImageToCommandsApp:
         hex_color = hex_color.lstrip('#')
         return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
+    def _rgb_to_lab(self, rgb_tuple):
+        """Converts an (R, G, B) tuple to a perceptually uniform CIE-L*a*b* tuple."""
+        r, g, b = [x / 255.0 for x in rgb_tuple]
+
+        # Gamma correction (sRGB to linear RGB)
+        r = ((r + 0.055) / 1.055) ** 2.4 if r > 0.04045 else r / 12.92
+        g = ((g + 0.055) / 1.055) ** 2.4 if g > 0.04045 else g / 12.92
+        b = ((b + 0.055) / 1.055) ** 2.4 if b > 0.04045 else b / 12.92
+
+        # Convert to XYZ color space
+        x = (r * 0.4124 + g * 0.3576 + b * 0.1805) * 100
+        y = (r * 0.2126 + g * 0.7152 + b * 0.0722) * 100
+        z = (r * 0.0193 + g * 0.1192 + b * 0.9505) * 100
+
+        # Convert XYZ to Lab (using D65 illuminant reference)
+        ref_x, ref_y, ref_z = 95.047, 100.0, 108.883
+        x /= ref_x
+        y /= ref_y
+        z /= ref_z
+
+        # Transformation
+        x = x ** (1/3) if x > 0.008856 else (7.787 * x) + (16 / 116)
+        y = y ** (1/3) if y > 0.008856 else (7.787 * y) + (16 / 116)
+        z = z ** (1/3) if z > 0.008856 else (7.787 * z) + (16 / 116)
+
+        l = (116 * y) - 16
+        a = 500 * (x - y)
+        b_lab = 200 * (y - z)
+
+        return l, a, b_lab
+
     def _load_palette(self):
-        """Loads the palette and converts hex colors to RGB tuples for distance calculation."""
+        """Loads the palette and stores RGB tuples."""
         try:
             with open(PALETTE_FILE, 'r') as f:
                 data = json.load(f)
-                # Store as { "00": (r, g, b), ... }
-                return {key: self._hex_to_rgb(value['hex']) for key, value in data.items()}
+                # Store as { "00": {"rgb": (r,g,b)}, ... }
+                return {key: {"rgb": self._hex_to_rgb(value['hex'])} for key, value in data.items()}
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             return None
 
+    def _precalculate_lab_palette(self):
+        """Converts all palette RGB values to LAB and stores them."""
+        for key, values in self.palette_data.items():
+            values["lab"] = self._rgb_to_lab(values["rgb"])
+
     def _find_closest_color(self, rgb_tuple):
-        """Finds the closest color in the palette using Euclidean distance in RGB space."""
+        """Finds the closest color in the palette using Euclidean distance in CIE-L*a*b* space."""
         min_dist_sq = float('inf')
         best_key = "00"
-        r1, g1, b1 = rgb_tuple
+        # Convert the input pixel's color to LAB space for comparison
+        l1, a1, b1 = self._rgb_to_lab(rgb_tuple)
 
-        for key, palette_rgb in self.palette_rgb.items():
-            r2, g2, b2 = palette_rgb
-            dist_sq = (r1 - r2)**2 + (g1 - g2)**2 + (b1 - b2)**2
+        for key, palette_values in self.palette_data.items():
+            l2, a2, b2 = palette_values["lab"]
+            # Standard Euclidean distance, but in the perceptually uniform LAB space
+            dist_sq = (l1 - l2)**2 + (a1 - a2)**2 + (b1 - b2)**2
             if dist_sq < min_dist_sq:
                 min_dist_sq = dist_sq
                 best_key = key
@@ -104,23 +144,30 @@ class ImageToCommandsApp:
             # 1. Open and convert to RGB
             img = Image.open(file_path).convert("RGB")
 
-            # 2. Resize while maintaining aspect ratio, then crop to a square
+            # 2. Resize in two steps for better quality: original -> 64x64 -> 32x32
+            INTERMEDIATE_SIZE = 128
+            
+            # Step 2a: Resize to fit within the intermediate size (64x64)
             w, h = img.size
             if w > h:
-                new_h = CANVAS_SIZE
+                new_h = INTERMEDIATE_SIZE
                 new_w = int(w * (new_h / h))
             else:
-                new_w = CANVAS_SIZE
+                new_w = INTERMEDIATE_SIZE
                 new_h = int(h * (new_w / w))
             
-            resized_img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            # High-quality downsample to intermediate size
+            resized_img_64 = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-            left = (new_w - CANVAS_SIZE) / 2
-            top = (new_h - CANVAS_SIZE) / 2
-            right = (new_w + CANVAS_SIZE) / 2
-            bottom = (new_h + CANVAS_SIZE) / 2
+            # Crop to a square 64x64
+            left = (new_w - INTERMEDIATE_SIZE) / 2
+            top = (new_h - INTERMEDIATE_SIZE) / 2
+            right = (new_w + INTERMEDIATE_SIZE) / 2
+            bottom = (new_h + INTERMEDIATE_SIZE) / 2
+            cropped_img_64 = resized_img_64.crop((left, top, right, bottom))
 
-            final_img = resized_img.crop((left, top, right, bottom))
+            # Step 2b: Downsample from 64x64 to the final 32x32 canvas size
+            final_img = cropped_img_64.resize((CANVAS_SIZE, CANVAS_SIZE), Image.Resampling.LANCZOS)
 
             # 3. Generate commands and draw preview
             self.preview_canvas.delete("all")
@@ -137,7 +184,7 @@ class ImageToCommandsApp:
                     commands.append(f"!pixel {x},{y},{closest_color_key}")
 
                     # Draw preview pixel
-                    palette_rgb = self.palette_rgb[closest_color_key]
+                    palette_rgb = self.palette_data[closest_color_key]["rgb"]
                     color_hex = f"#{palette_rgb[0]:02x}{palette_rgb[1]:02x}{palette_rgb[2]:02x}"
                     self.preview_canvas.create_rectangle(
                         x * PREVIEW_PIXEL_SIZE, y * PREVIEW_PIXEL_SIZE,
