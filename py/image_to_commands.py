@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import json
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageFilter
 import os
 
 # --- Configuration ---
@@ -10,6 +10,7 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 PALETTE_FILE = os.path.join(PROJECT_ROOT, "pallette.json")
 CANVAS_SIZE = 32
 PREVIEW_PIXEL_SIZE = 10
+SUPER_SAMPLE_FACTOR = 10 # Process at 10x resolution (320x320) then scale down
 
 class ImageToCommandsApp:
     def __init__(self, root):
@@ -23,8 +24,8 @@ class ImageToCommandsApp:
             messagebox.showerror("Error", f"Could not load or parse '{PALETTE_FILE}'.")
             self.root.destroy()
             return
-        # Pre-calculate LAB values for the palette for efficiency
-        self._precalculate_lab_palette()
+        # Prepare the palette for dithering
+        self._prepare_dithering_palette()
 
         # --- UI Setup ---
         self.main_frame = ttk.Frame(self.root, padding="10")
@@ -66,37 +67,6 @@ class ImageToCommandsApp:
         hex_color = hex_color.lstrip('#')
         return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
-    def _rgb_to_lab(self, rgb_tuple):
-        """Converts an (R, G, B) tuple to a perceptually uniform CIE-L*a*b* tuple."""
-        r, g, b = [x / 255.0 for x in rgb_tuple]
-
-        # Gamma correction (sRGB to linear RGB)
-        r = ((r + 0.055) / 1.055) ** 2.4 if r > 0.04045 else r / 12.92
-        g = ((g + 0.055) / 1.055) ** 2.4 if g > 0.04045 else g / 12.92
-        b = ((b + 0.055) / 1.055) ** 2.4 if b > 0.04045 else b / 12.92
-
-        # Convert to XYZ color space
-        x = (r * 0.4124 + g * 0.3576 + b * 0.1805) * 100
-        y = (r * 0.2126 + g * 0.7152 + b * 0.0722) * 100
-        z = (r * 0.0193 + g * 0.1192 + b * 0.9505) * 100
-
-        # Convert XYZ to Lab (using D65 illuminant reference)
-        ref_x, ref_y, ref_z = 95.047, 100.0, 108.883
-        x /= ref_x
-        y /= ref_y
-        z /= ref_z
-
-        # Transformation
-        x = x ** (1/3) if x > 0.008856 else (7.787 * x) + (16 / 116)
-        y = y ** (1/3) if y > 0.008856 else (7.787 * y) + (16 / 116)
-        z = z ** (1/3) if z > 0.008856 else (7.787 * z) + (16 / 116)
-
-        l = (116 * y) - 16
-        a = 500 * (x - y)
-        b_lab = 200 * (y - z)
-
-        return l, a, b_lab
-
     def _load_palette(self):
         """Loads the palette and stores RGB tuples."""
         try:
@@ -107,22 +77,48 @@ class ImageToCommandsApp:
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             return None
 
-    def _precalculate_lab_palette(self):
-        """Converts all palette RGB values to LAB and stores them."""
-        for key, values in self.palette_data.items():
-            values["lab"] = self._rgb_to_lab(values["rgb"])
+    def _prepare_dithering_palette(self):
+        """Prepares the palette for use with Pillow's quantize method."""
+        # Sort keys numerically to ensure index from quantize matches our key order
+        self.sorted_palette_keys = sorted(self.palette_data.keys(), key=int)
+
+        # Create a flat palette list [r,g,b, r,g,b, ...] for Pillow
+        flat_palette = []
+        for key in self.sorted_palette_keys:
+            flat_palette.extend(self.palette_data[key]["rgb"])
+
+        # The palette must be 768 values (256 colors * 3 channels).
+        # Pad with black if our palette is smaller.
+        if len(flat_palette) < 256 * 3:
+            flat_palette.extend([0, 0, 0] * (256 - len(self.sorted_palette_keys)))
+
+        # Create a 1x1 palette image that Pillow can use for quantization
+        self.dither_palette_img = Image.new("P", (1, 1))
+        self.dither_palette_img.putpalette(flat_palette)
+
+        # Find the darkest and lightest colors in the palette for line art preservation
+        self.darkest_color_key = "00"
+        self.lightest_color_key = "00"
+        min_lum = 256
+        max_lum = -1
+        for key, value in self.palette_data.items():
+            r, g, b = value["rgb"]
+            # Using a simple luminance calculation
+            luminance = 0.299*r + 0.587*g + 0.114*b
+            if luminance < min_lum:
+                min_lum = luminance
+                self.darkest_color_key = key
 
     def _find_closest_color(self, rgb_tuple):
-        """Finds the closest color in the palette using Euclidean distance in CIE-L*a*b* space."""
+        """Finds the closest color in the palette using Euclidean distance in RGB space."""
         min_dist_sq = float('inf')
         best_key = "00"
-        # Convert the input pixel's color to LAB space for comparison
-        l1, a1, b1 = self._rgb_to_lab(rgb_tuple)
+        r1, g1, b1 = rgb_tuple
 
         for key, palette_values in self.palette_data.items():
-            l2, a2, b2 = palette_values["lab"]
-            # Standard Euclidean distance, but in the perceptually uniform LAB space
-            dist_sq = (l1 - l2)**2 + (a1 - a2)**2 + (b1 - b2)**2
+            r2, g2, b2 = palette_values["rgb"]
+            # Standard Euclidean distance in RGB space. Much faster than LAB.
+            dist_sq = (r1 - r2)**2 + (g1 - g2)**2 + (b1 - b2)**2
             if dist_sq < min_dist_sq:
                 min_dist_sq = dist_sq
                 best_key = key
@@ -141,46 +137,76 @@ class ImageToCommandsApp:
             self.status_label.config(text=f"Processing '{os.path.basename(file_path)}'...")
             self.root.update_idletasks()
 
-            # 1. Open and convert to RGB
-            img = Image.open(file_path).convert("RGB")
+            # 1. Open image
+            img = Image.open(file_path)
 
-            # 2. Resize in two steps for better quality: original -> 64x64 -> 32x32
-            INTERMEDIATE_SIZE = 128
+            # 2. Crop image to a 1:1 aspect ratio from the center, preserving the shortest side.
+            width, height = img.size
+            if width != height:
+                short_side = min(width, height)
+                left = (width - short_side) / 2
+                top = (height - short_side) / 2
+                right = (width + short_side) / 2
+                bottom = (height + short_side) / 2
+                img = img.crop((left, top, right, bottom))
+
+            # 3. Supersample: Resize to a much larger canvas for high-resolution processing.
+            # We use LANCZOS for a high-quality upscale.
+            super_sample_size = CANVAS_SIZE * SUPER_SAMPLE_FACTOR
+            high_res_img = img.resize((super_sample_size, super_sample_size), Image.Resampling.LANCZOS).convert("RGBA")
+
+            # 4. Separate the alpha channel to use as a definitive silhouette mask later
+            high_res_alpha_mask = high_res_img.getchannel('A')
+
+            # --- 5. Create the "Color Fill" Layer at high resolution ---
+            high_res_color_fill_paletted = high_res_img.convert("RGB").quantize(
+                palette=self.dither_palette_img,
+                dither=Image.Dither.FLOYDSTEINBERG
+            )
+            high_res_color_fill_rgb = high_res_color_fill_paletted.convert("RGB").filter(ImageFilter.MedianFilter(size=11))
+
+            # --- 6. Create the "Line Art" Layer at high resolution ---
+            # Use CONTOUR filter on a grayscale version to find edges
+            high_res_line_art_mask = high_res_img.convert('L').filter(ImageFilter.CONTOUR)
+            # Invert the mask: lines are black (0), so we want to use them as the mask.
+            high_res_line_art_mask = high_res_line_art_mask.point(lambda p: 255 if p < 128 else 0)
+
+            # --- 7. Combine Layers at high resolution ---
+            # Create a solid layer of the darkest palette color for the lines
+            darkest_color_rgb = self.palette_data[self.darkest_color_key]["rgb"]
+            line_art_color_layer = Image.new("RGB", high_res_img.size, darkest_color_rgb)
+            # Paste the line art over the color fill
+            high_res_color_fill_rgb.paste(line_art_color_layer, mask=high_res_line_art_mask)
+
+            # --- 8. Final Assembly at high resolution ---
+            high_res_final_img = high_res_color_fill_rgb.convert("RGBA")
+            high_res_final_img.putalpha(high_res_alpha_mask)
+
+            # --- 9. Denoise the supersampled image ---
+            # Apply a Median Filter to the final high-resolution image before downscaling.
+            # This is effective at removing small artifacts from dithering and line art
+            # without causing the "blobby" effect of filtering the final 32x32 image.
+            high_res_final_img = high_res_final_img.filter(ImageFilter.RankFilter(size=5, rank=20))
+
+            # --- 10. Scale the high-res processed image down to the final canvas size ---
+            # This is the final step of supersampling, averaging the results.
+            final_img = high_res_final_img.resize((CANVAS_SIZE, CANVAS_SIZE), Image.Resampling.NEAREST)
             
-            # Step 2a: Resize to fit within the intermediate size (64x64)
-            w, h = img.size
-            if w > h:
-                new_h = INTERMEDIATE_SIZE
-                new_w = int(w * (new_h / h))
-            else:
-                new_w = INTERMEDIATE_SIZE
-                new_h = int(h * (new_w / w))
-            
-            # High-quality downsample to intermediate size
-            resized_img_64 = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-            # Crop to a square 64x64
-            left = (new_w - INTERMEDIATE_SIZE) / 2
-            top = (new_h - INTERMEDIATE_SIZE) / 2
-            right = (new_w + INTERMEDIATE_SIZE) / 2
-            bottom = (new_h + INTERMEDIATE_SIZE) / 2
-            cropped_img_64 = resized_img_64.crop((left, top, right, bottom))
-
-            # Step 2b: Downsample from 64x64 to the final 32x32 canvas size
-            final_img = cropped_img_64.resize((CANVAS_SIZE, CANVAS_SIZE), Image.Resampling.LANCZOS)
-
-            # 3. Generate commands and draw preview
+            # --- 11. Generate Commands and Draw Preview from the final 32x32 image ---
             self.preview_canvas.delete("all")
             self.commands_text.delete("1.0", tk.END)
             
             commands = []
-            pixels = final_img.load()
+            final_pixels = final_img.load()
+
             for y in range(CANVAS_SIZE):
                 for x in range(CANVAS_SIZE):
-                    pixel_rgb = pixels[x, y]
-                    closest_color_key = self._find_closest_color(pixel_rgb)
-                    
-                    # Add command to list
+                    r, g, b, a = final_pixels[x, y]
+                    if a < 128: # Check the final, masked alpha value
+                        continue
+
+                    # Find the closest color key for the final pixel's RGB value
+                    closest_color_key = self._find_closest_color((r, g, b))
                     commands.append(f"!pixel {x},{y},{closest_color_key}")
 
                     # Draw preview pixel
@@ -192,7 +218,7 @@ class ImageToCommandsApp:
                         fill=color_hex, outline=""
                     )
 
-            # 4. Display commands
+            # 12. Display commands
             self.commands_text.insert("1.0", "\n".join(commands))
             self.status_label.config(text=f"Done! {len(commands)} commands generated.")
 
