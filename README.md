@@ -2,7 +2,12 @@
 
 A collection of Python tools to help you create artwork for collaborative pixel art projects. These scripts allow you to generate color guides and convert images into a series of chat commands.
 
- <!-- It's a good idea to add a screenshot of your canvas here! -->
+## Canvas Usage
+
+You can use the command '!pixel x,y,##' in any of the following:
+*Discord: https://discord.gg/gXKxKvHEAA (any channel (where appropriate) but feedback in #mini-pixel-canvas channel)
+*Youtube: https://www.youtube.com/@DeviousSiddy (when live, in livechat)
+*Twitch: https://www.twitch.tv/devioussiddy (in chat)
 
 ## Features
 
