@@ -5,9 +5,9 @@ A collection of Python tools to help you create artwork for collaborative pixel 
 ## Canvas Usage
 
 You can use the command '!pixel x,y,##' in any of the following:
-*Discord: https://discord.gg/gXKxKvHEAA (any channel (where appropriate) but feedback in #mini-pixel-canvas channel)
-*Youtube: https://www.youtube.com/@DeviousSiddy (when live, in livechat)
-*Twitch: https://www.twitch.tv/devioussiddy (in chat)
+*    **Discord**: https://discord.gg/gXKxKvHEAA (any channel (where appropriate) but feedback in #mini-pixel-canvas channel)
+*    **Youtube**: https://www.youtube.com/@DeviousSiddy (when live, in livechat)
+*    **Twitch**: https://www.twitch.tv/devioussiddy (in chat)
 
 ## Features
 
